@@ -1,0 +1,13 @@
+{
+  "initial": {
+    "invoices": "invoices_extracted.json",
+    "corrections": "human_corrections.json",
+    "reference": "reference_data.json"
+  },
+  "full": {
+    "invoices": "full_invoices_extracted.json",
+    "corrections": "full_human_corrections.json",
+    "purchaseOrders": "full_purchase_orders.json",
+    "deliveryNotes": "full_delivery_notes.json"
+  }
+}

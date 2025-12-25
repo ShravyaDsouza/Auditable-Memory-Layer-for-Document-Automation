@@ -1,0 +1,40 @@
+[
+{
+"poNumber": "PO-A-050",
+"vendor": "Supplier GmbH",
+"date": "2024-01-05",
+"lineItems": [{ "sku": "WIDGET-001", "qty": 100, "unitPrice": 25.0 }]
+},
+{
+"poNumber": "PO-A-051",
+"vendor": "Supplier GmbH",
+
+"date": "2024-01-18",
+"lineItems": [{ "sku": "WIDGET-002", "qty": 20, "unitPrice": 25.0 }]
+},
+{
+"poNumber": "PO-B-110",
+"vendor": "Parts AG",
+"date": "2024-02-01",
+"lineItems": [{ "sku": "BOLT-99", "qty": 200, "unitPrice": 10.0 }]
+},
+{
+"poNumber": "PO-B-111",
+"vendor": "Parts AG",
+"date": "2024-03-01",
+"lineItems": [{ "sku": "NUT-10", "qty": 500, "unitPrice": 2.0 }]
+},
+{
+"poNumber": "PO-C-900",
+"vendor": "Freight & Co",
+"date": "2024-03-01",
+"lineItems": [{ "sku": "FREIGHT", "qty": 1, "unitPrice": 1000.0 }]
+},
+{
+"poNumber": "PO-C-901",
+"vendor": "Freight & Co",
+"date": "2024-03-15",
+"lineItems": [{ "sku": "FREIGHT", "qty": 1, "unitPrice": 1000.0 }]
+
+}
+]

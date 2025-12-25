@@ -1,0 +1,29 @@
+[
+{
+"invoiceId": "INV-A-001",
+"vendor": "Supplier GmbH",
+"corrections": [
+{
+"field": "serviceDate",
+"from": null,
+"to": "2024-01-01",
+"reason": "Leistungsdatum found in raw text"
+}
+],
+"finalDecision": "approved"
+},
+{
+"invoiceId": "INV-B-001",
+"vendor": "Parts AG",
+"corrections": [
+{
+"field": "taxTotal",
+"from": 400.0,
+
+"to": 380.0,
+"reason": "VAT included in total; recalculated"
+}
+],
+"finalDecision": "approved"
+}
+]

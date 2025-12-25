@@ -1,0 +1,56 @@
+[
+{
+"invoiceId": "INV-A-001",
+"vendor": "Supplier GmbH",
+
+"corrections": [
+{ "field": "serviceDate", "from": null, "to": "2024-01-01", "reason": "Leistungsdatum found in rawText" }
+],
+"finalDecision": "approved"
+},
+{
+"invoiceId": "INV-A-003",
+"vendor": "Supplier GmbH",
+"corrections": [
+{ "field": "poNumber", "from": null, "to": "PO-A-051", "reason": "Only matching PO for vendor within 30 days and matching item WIDGET-002" },
+{ "field": "serviceDate", "from": null, "to": "2024-01-20", "reason": "Leistungsdatum found in rawText" }
+],
+"finalDecision": "approved"
+},
+{
+"invoiceId": "INV-B-001",
+"vendor": "Parts AG",
+"corrections": [
+{ "field": "grossTotal", "from": 2400.0, "to": 2380.0, "reason": "Raw text indicates totals already include VAT; extractor overestimated" },
+{ "field": "taxTotal", "from": 400.0, "to": 380.0, "reason": "Recalculated from grossTotal and taxRate" }
+],
+"finalDecision": "approved"
+
+},
+{
+"invoiceId": "INV-B-003",
+"vendor": "Parts AG",
+"corrections": [
+{ "field": "currency", "from": null, "to": "EUR", "reason": "Currency appears in rawText" }
+],
+"finalDecision": "approved"
+},
+{
+"invoiceId": "INV-C-001",
+"vendor": "Freight & Co",
+"corrections": [
+{ "field": "discountTerms", "from": null, "to": "2% Skonto within 10 days", "reason":
+"Skonto terms in rawText" }
+],
+"finalDecision": "approved"
+},
+{
+"invoiceId": "INV-C-002",
+"vendor": "Freight & Co",
+"corrections": [
+{ "field": "lineItems[0].sku", "from": null, "to": "FREIGHT", "reason": "Vendor uses descriptions (Seefracht/Shipping) that map to FREIGHT" }
+],
+"finalDecision": "approved"
+
+}
+]
