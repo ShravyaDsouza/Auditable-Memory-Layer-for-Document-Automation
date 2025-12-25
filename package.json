@@ -1,0 +1,24 @@
+{
+  "name": "mem_layer",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "demo": "tsx src/demo/runInvoice.ts",
+    "admin:list": "tsx src/admin/listMemory.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "better-sqlite3": "^12.5.0",
+    "zod": "^4.2.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.0.3",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
