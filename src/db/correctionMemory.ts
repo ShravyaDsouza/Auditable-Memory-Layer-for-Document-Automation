@@ -158,3 +158,43 @@ export function markUsed(db: Database, id: string) {
     `
   ).run(new Date().toISOString(), id);
 }
+
+export function markRejected(db: Database, id: string) {
+  const useStatus = hasStatusColumn(db);
+
+  if (useStatus) {
+    db.prepare(
+      `
+      UPDATE correction_memory
+      SET rejectCount = COALESCE(rejectCount, 0) + 1,
+          status = CASE
+            WHEN COALESCE(rejectCount, 0) + 1 >= 2 THEN 'disabled'
+            ELSE status
+          END,
+          lastUsedAt = ?
+      WHERE id = ?
+      `
+    ).run(new Date().toISOString(), id);
+
+    return;
+  }
+
+  // schema WITHOUT status column → still track rejectCount
+  db.prepare(
+    `
+    UPDATE correction_memory
+    SET rejectCount = COALESCE(rejectCount, 0) + 1,
+        lastUsedAt = ?
+    WHERE id = ?
+    `
+  ).run(new Date().toISOString(), id);
+}
+
+export function getCorrectionMemoryById(
+  db: Database,
+  id: string
+): CorrectionMemoryRow | undefined {
+  return db.prepare(`SELECT * FROM correction_memory WHERE id = ?`).get(id) as
+    | CorrectionMemoryRow
+    | undefined;
+}
