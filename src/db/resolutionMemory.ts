@@ -279,3 +279,9 @@ export function recordResolutionDecision(
 
   return { vendor, key, value: out.value, confidence: out.confidence };
 }
+
+export function getAllResolutionsForVendor(db: Database, vendor: string) {
+  return db
+    .prepare(`SELECT * FROM resolution_memory WHERE vendor = ? ORDER BY key ASC`)
+    .all(vendor) as any[];
+}

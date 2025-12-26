@@ -6,22 +6,28 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-export function disableVendorMemory(db: Database, id: number) {
-  db.prepare(`UPDATE vendor_memory SET disabledAt = ? WHERE id = ?`).run(nowIso(), id);
+export function disableVendorMemory(db: Database, id: string) {
+  const res = db
+    .prepare(`UPDATE vendor_memory SET status='disabled', disabledAt=? WHERE id=?`)
+    .run(nowIso(), id);
+
   logAuditEvent(db, {
     eventType: "ADMIN_ACTION",
     entityType: "vendor_memory",
-    entityId: String(id),
-    meta: { action: "disable" },
+    entityId: id,
+    meta: { action: "disable", changes: res.changes },
   });
 }
 
-export function resetVendorMemoryConfidence(db: Database, id: number, to: number) {
-  db.prepare(`UPDATE vendor_memory SET confidence = ?, rejectCount = 0 WHERE id = ?`).run(to, id);
+export function resetVendorMemoryConfidence(db: Database, id: string, to: number) {
+  const res = db
+    .prepare(`UPDATE vendor_memory SET confidence=?, rejectCount=0 WHERE id=?`)
+    .run(to, id);
+
   logAuditEvent(db, {
     eventType: "MEMORY_CONFIDENCE_RESET",
     entityType: "vendor_memory",
-    entityId: String(id),
-    meta: { action: "reset-confidence", to },
+    entityId: id,
+    meta: { action: "reset-confidence", to, changes: res.changes },
   });
 }

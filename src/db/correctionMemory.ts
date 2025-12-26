@@ -198,3 +198,22 @@ export function getCorrectionMemoryById(
     | CorrectionMemoryRow
     | undefined;
 }
+
+export function incrementCorrectionMemoryReject(db: Database, id: string, nowIso: string) {
+  db.prepare(`
+    UPDATE correction_memory
+    SET rejectCount = COALESCE(rejectCount, 0) + 1,
+        lastUsedAt = COALESCE(lastUsedAt, @nowIso)
+    WHERE id = @id
+  `).run({ id, nowIso });
+}
+
+export function disableCorrectionMemory(db: Database, id: string, nowIso: string) {
+  // only works if status col exists; otherwise just keep rejectCount
+  db.prepare(`
+    UPDATE correction_memory
+    SET status = 'disabled',
+        lastUsedAt = COALESCE(lastUsedAt, @nowIso)
+    WHERE id = @id
+  `).run({ id, nowIso });
+}

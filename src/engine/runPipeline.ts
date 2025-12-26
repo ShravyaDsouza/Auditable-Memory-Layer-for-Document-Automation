@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import type { AgentOutput } from "../types/output.js";
-import { getVendorMemories, upsertVendorMemory } from "../db/vendorMemory.js";
+import { getVendorMemories, upsertVendorMemory, markVendorRejected } from "../db/vendorMemory.js";
 import { hasLearned, markLearned } from "../db/learningEvents.js";
 import { detectDuplicate, recordDuplicate } from "./duplicateGuard.js";
 import { logAuditEvent } from "../db/auditEvents.js";
@@ -9,9 +9,10 @@ import {
   findCorrectionMemory,
   markUsed,
   upsertCorrectionMemory,
-  markRejected, // ✅ added
+  markRejected,
 } from "../db/correctionMemory.js";
 import { getResolution, recordResolutionDecision } from "../db/resolutionMemory.js";
+import { daysSince, decayedConfidence } from "./confidenceDecay.js";
 
 /* ------------------ Helpers ------------------ */
 
@@ -58,7 +59,7 @@ function round2(n: number) {
   return Math.round(n * 100) / 100;
 }
 
-/** DECIDE helpers (moved out of runPipeline for cleanliness) */
+/** DECIDE helpers */
 function isMissing(v: any) {
   return v === null || v === undefined || v === "";
 }
@@ -71,7 +72,7 @@ function hasCriticalMissingFields(normalized: any) {
   const missingNet = !Number.isFinite(Number(normalized.netTotal));
   const missingGross = !Number.isFinite(Number(normalized.grossTotal));
 
-  // keep PO as "review trigger" (tune if you want it optional)
+  // keep PO as review-trigger (tune if needed)
   const missingPo = isMissing(normalized.poNumber);
 
   return (
@@ -85,16 +86,13 @@ function hasCriticalMissingFields(normalized: any) {
 }
 
 function extractLeistungsdatum(rawText: string): string | null {
-  const m = rawText.match(
-    /Leistungsdatum:\s*([0-9]{2})\.([0-9]{2})\.([0-9]{4})/
-  );
+  const m = rawText.match(/Leistungsdatum:\s*([0-9]{2})\.([0-9]{2})\.([0-9]{4})/);
   if (!m) return null;
   const [, dd, mm, yyyy] = m;
   return `${yyyy}-${mm}-${dd}`;
 }
 
 function parseCurrency(rawText: string): string | null {
-  // examples: "Currency: EUR" or "Total: 2380.00 EUR"
   const m1 = rawText.match(/\bCurrency:\s*([A-Z]{3})\b/);
   if (m1) return m1[1];
 
@@ -108,7 +106,6 @@ function parseCurrency(rawText: string): string | null {
 }
 
 function extractTotalFromRawText(rawText: string): number | null {
-  // Example: "Total: 2380.00 EUR"
   const m = rawText.match(/Total:\s*([0-9]+(?:[.,][0-9]{2})?)/i);
   if (!m) return null;
   const normalized = m[1].replace(",", ".");
@@ -121,13 +118,11 @@ function isVatInclusiveText(rawText: string): boolean {
 }
 
 function extractSkonto(rawText: string): { percent: number; days: number } | null {
-  // match both "days" and German "Tage"
   const m = rawText.match(/(\d+)%\s*Skonto.*?(\d+)\s*(days|tage)/i);
   if (!m) return null;
   return { percent: Number(m[1]), days: Number(m[2]) };
 }
 
-/* Supplier PO helper (kept simple) */
 function parseDateToIso(dateStr: string | null | undefined): string | null {
   if (!dateStr) return null;
 
@@ -154,15 +149,10 @@ function daysBetween(aIso: string, bIso: string): number {
 }
 
 function getInvoiceSkus(extracted: any): string[] {
-  return (extracted.fields?.lineItems ?? [])
-    .map((x: any) => x?.sku)
-    .filter(Boolean);
+  return (extracted.fields?.lineItems ?? []).map((x: any) => x?.sku).filter(Boolean);
 }
 
-function suggestPoNumber(
-  context: any,
-  daysWindow = 30
-): { poNumber: string; reason: string } | null {
+function suggestPoNumber(context: any, daysWindow = 30): { poNumber: string; reason: string } | null {
   const vendor = context.vendor;
   const extracted = context.extracted;
   const invoiceDateIso = parseDateToIso(extracted.fields?.invoiceDate);
@@ -182,9 +172,7 @@ function suggestPoNumber(
   if (candidates.length === 1) {
     return {
       poNumber: candidates[0].poNumber,
-      reason: `Only matching PO for vendor within ${daysWindow} days and matching SKU (${skus.join(
-        ", "
-      )}).`,
+      reason: `Only matching PO for vendor within ${daysWindow} days and matching SKU (${skus.join(", ")}).`,
     };
   }
 
@@ -201,44 +189,57 @@ function findMatchingDeliveryQty(context: any, sku: string): number | null {
 
   for (const dn of dns) {
     const li = dn.lineItems?.find((x: any) => x.sku === sku);
-    if (li && Number.isFinite(li.qtyDelivered)) {
-      return li.qtyDelivered;
-    }
+    if (li && Number.isFinite(li.qtyDelivered)) return li.qtyDelivered;
   }
 
   return null;
 }
 
-/** ✅ suspect/disabled guard (prevents wrong memory) */
-function isSuspectCorrectionMemory(args: { mem: any; resolution?: any | null }) {
-  const { mem, resolution } = args;
+/** ✅ guard: never auto-apply disabled/suspect correction memories */
+function isSuspectCorrectionMemory(args: { mem: any; resolution?: any | null; now: Date }) {
+  const { mem, resolution, now } = args;
 
   if (!mem) return true;
 
-  // if schema has status, findCorrectionMemory already filters to active,
-  // but keep this guard to be safe.
+  // If schema supports status, keep this anyway (defensive)
   if (mem.status && mem.status !== "active") return true;
 
   const rejectCount = Number(mem.rejectCount ?? 0);
   if (rejectCount >= 2) return true;
 
-  const conf = Number(mem.confidence ?? 0);
-  if (conf > 0 && conf < 0.65) return true;
+  // base confidence too low → don't auto apply
+  const baseConf = Number(mem.confidence ?? 0);
+  if (baseConf > 0 && baseConf < 0.65) return true;
 
-  // if a strategy is repeatedly rejected, don't trust correction memory for it
+  // resolution strategy repeatedly rejected → distrust auto-apply
   const r = Number(resolution?.value?.rejected ?? 0);
   if (r >= 2) return true;
+
+  // time-decayed confidence too low → don't auto apply
+  const ageDays = daysSince(mem.lastUsedAt ?? mem.createdAt ?? null, now);
+  const eff = decayedConfidence(baseConf, ageDays);
+  if (eff < 0.65) return true;
 
   return false;
 }
 
+/** vendor memory “apply guard” */
+function canApplyVendorMem(mem: any, now: Date) {
+  if (!mem) return false;
+  if (mem.status && mem.status !== "active") return false;
+  const rejects = Number(mem.rejectCount ?? 0);
+  if (rejects >= 2) return false;
+
+  const base = Number(mem.confidence ?? 0);
+  const ageDays = daysSince(mem.lastUsedAt ?? mem.createdAt ?? null, now);
+  const eff = decayedConfidence(base, ageDays);
+
+  return eff >= 0.65;
+}
+
 /* ------------------ Pipeline ------------------ */
 
-export function runPipeline(
-  db: Database,
-  context: any,
-  opts?: { now?: Date }
-): AgentOutput {
+export function runPipeline(db: Database, context: any, opts?: { now?: Date }): AgentOutput {
   const now = opts?.now ?? new Date();
 
   const vendor = context.vendor as string;
@@ -247,7 +248,7 @@ export function runPipeline(
   const invoiceId: string = extracted.invoiceId;
 
   const usedResolutionKeys = new Set<string>();
-  const usedCorrectionMemoryIds = new Set<string>(); // ✅ added
+  const usedCorrectionMemoryIds = new Set<string>();
 
   // 1) DUPLICATE GUARD (hard stop)
   const dup = detectDuplicate(db, extracted, now);
@@ -278,10 +279,7 @@ export function runPipeline(
       eventType: "DUPLICATE_DETECTED",
       vendor: extracted.vendor,
       invoiceId: extracted.invoiceId,
-      meta: {
-        duplicateOfInvoiceId: dup.duplicateOfInvoiceId,
-        reason: dup.reason,
-      },
+      meta: { duplicateOfInvoiceId: dup.duplicateOfInvoiceId, reason: dup.reason },
       now,
     });
 
@@ -310,16 +308,17 @@ export function runPipeline(
   let confidenceScore = 0.25;
 
   /* -------- RECALL -------- */
-  const vendorMems = getVendorMemories(db, vendor).filter((m) => m.status === "active");
-
+  // ✅ Recall *all* vendor memories (including disabled) for explanation/governance
+  const vendorMemsAll = getVendorMemories(db, vendor);
   auditTrail.push({
     step: "recall",
     timestamp: nowIso(now),
-    details: `Recalled ${vendorMems.length} vendor memories for ${vendor}.`,
+    details: `Recalled ${vendorMemsAll.length} vendor memories for ${vendor}.`,
   });
 
+  // ✅ correction memory already filters to active if schema has status
+  // but we still treat suspect/disabled defensively later
   const corrMems = getCorrectionMemories(db, vendor);
-
   auditTrail.push({
     step: "recall",
     timestamp: nowIso(now),
@@ -329,17 +328,29 @@ export function runPipeline(
   /* -------- APPLY -------- */
 
   // Supplier: serviceDate
-  const hasServiceDateMemory = vendorMems.some(
-    (m) => m.kind === "serviceDate_from_label" && m.pattern === "Leistungsdatum"
+  const serviceMem = vendorMemsAll.find(
+    (m: any) => m.kind === "serviceDate_from_label" && m.pattern === "Leistungsdatum"
   );
+
+  const canUseServiceMem = serviceMem ? canApplyVendorMem(serviceMem, now) : false;
 
   const candidateServiceDate = extractLeistungsdatum(rawText);
   if (candidateServiceDate && extracted.fields?.serviceDate == null) {
     const resKey = RES_KEYS.serviceDate;
     usedResolutionKeys.add(resKey);
 
-    const base = hasServiceDateMemory ? 0.85 : 0.55;
-    const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base });
+    // base from memory vs heuristic
+    const base = canUseServiceMem ? 0.85 : 0.55;
+
+    // apply time decay to the memory-shaped base confidence if using memory
+    const baseAfterDecay = canUseServiceMem
+      ? decayedConfidence(
+          base,
+          daysSince(serviceMem?.lastUsedAt ?? serviceMem?.createdAt ?? null, now)
+        )
+      : base;
+
+    const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base: baseAfterDecay });
     const appliedConfidence = shaped.adjusted;
 
     auditTrail.push({
@@ -352,55 +363,84 @@ export function runPipeline(
       field: "serviceDate",
       from: null,
       to: candidateServiceDate,
-      source: hasServiceDateMemory ? "vendor_memory" : "rawText_heuristic",
+      source: canUseServiceMem ? "vendor_memory" : "rawText_heuristic",
       confidence: appliedConfidence,
       reason: `Found Leistungsdatum in rawText (${candidateServiceDate}).`,
     });
 
     reasoningParts.push(
-      hasServiceDateMemory
-        ? `Applied vendor memory: "${vendor}" uses Leistungsdatum as service date.`
+      canUseServiceMem
+        ? `Applied vendor memory (decayed): "${vendor}" uses Leistungsdatum as service date.`
         : `Heuristic: rawText contains Leistungsdatum, suggesting serviceDate.`
     );
 
     confidenceScore = Math.max(confidenceScore, appliedConfidence);
+
+    // optional: update lastUsedAt only when used as memory
+    if (canUseServiceMem && serviceMem?.id) {
+      // you may already have a vendorMemory markUsed; if not, ignore
+      // (keeping audit-only is fine)
+    }
+  } else if (serviceMem && !canUseServiceMem) {
+    auditTrail.push({
+      step: "apply",
+      timestamp: nowIso(now),
+      details: `Vendor memory for serviceDate exists but is disabled/suspect/decayed; not auto-applied (id=${serviceMem.id}).`,
+    });
   }
 
   // Supplier: PO inference (only if learned)
-  const hasPoMemory = vendorMems.some(
-    (m) => m.kind === "po_match_strategy" && m.pattern === "sku_and_date_window"
+  const poMem = vendorMemsAll.find(
+    (m: any) => m.kind === "po_match_strategy" && m.pattern === "sku_and_date_window"
   );
+  const canUsePoMem = poMem ? canApplyVendorMem(poMem, now) : false;
 
-  if (extracted.fields?.poNumber == null && hasPoMemory) {
+  if (extracted.fields?.poNumber == null && canUsePoMem) {
     const suggestion = suggestPoNumber(context, 30);
     if (suggestion) {
+      const base = 0.82;
+      const baseAfterDecay = decayedConfidence(
+        base,
+        daysSince(poMem?.lastUsedAt ?? poMem?.createdAt ?? null, now)
+      );
+
       proposedCorrections.push({
         field: "poNumber",
         from: null,
         to: suggestion.poNumber,
         source: "vendor_memory",
-        confidence: 0.82,
+        confidence: baseAfterDecay,
         reason: suggestion.reason,
       });
 
-      reasoningParts.push("Applied vendor memory: inferred PO using SKU + 30-day window.");
-      confidenceScore = Math.max(confidenceScore, 0.82);
+      reasoningParts.push("Applied vendor memory (decayed): inferred PO using SKU + 30-day window.");
+      confidenceScore = Math.max(confidenceScore, baseAfterDecay);
     }
+  } else if (poMem && extracted.fields?.poNumber == null && !canUsePoMem) {
+    auditTrail.push({
+      step: "apply",
+      timestamp: nowIso(now),
+      details: `Vendor memory for PO inference exists but is disabled/suspect/decayed; not auto-applied (id=${poMem.id}).`,
+    });
   }
 
-  // Parts AG: VAT inclusive strategy (heuristic first, memory later)
-  const hasVatInclusiveMemory = vendorMems.some(
-    (m) => m.kind === "vat_inclusive_pricing" && m.pattern === "mwst_inkl"
+  // VAT inclusive
+  const vatMem = vendorMemsAll.find(
+    (m: any) => m.kind === "vat_inclusive_pricing" && m.pattern === "mwst_inkl"
   );
+  const canUseVatMem = vatMem ? canApplyVendorMem(vatMem, now) : false;
 
   const vatInclusiveDetected = isVatInclusiveText(rawText);
-
   if (vatInclusiveDetected) {
     const resKey = RES_KEYS.vatTotals;
     usedResolutionKeys.add(resKey);
 
-    const base = hasVatInclusiveMemory ? 0.85 : 0.6;
-    const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base });
+    const base = canUseVatMem ? 0.85 : 0.6;
+    const baseAfterDecay = canUseVatMem
+      ? decayedConfidence(base, daysSince(vatMem?.lastUsedAt ?? vatMem?.createdAt ?? null, now))
+      : base;
+
+    const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base: baseAfterDecay });
     const appliedConfidence = shaped.adjusted;
 
     auditTrail.push({
@@ -429,21 +469,21 @@ export function runPipeline(
 
       const expectedTax = round2(expectedGross - net);
 
-      let pushedAnyVatFix = false;
+      let pushedAny = false;
 
       if (Math.abs(currentGross - expectedGross) > 0.01) {
         proposedCorrections.push({
           field: "grossTotal",
           from: currentGross,
           to: expectedGross,
-          source: hasVatInclusiveMemory ? "vendor_memory" : "rawText_heuristic",
+          source: canUseVatMem ? "vendor_memory" : "rawText_heuristic",
           confidence: appliedConfidence,
           reason:
             grossFromText != null
               ? `VAT-inclusive pricing detected; rawText Total=${expectedGross} used for grossTotal.`
               : `VAT-inclusive pricing detected; recomputed grossTotal from netTotal and taxRate.`,
         });
-        pushedAnyVatFix = true;
+        pushedAny = true;
       }
 
       if (Math.abs(currentTax - expectedTax) > 0.01) {
@@ -451,32 +491,25 @@ export function runPipeline(
           field: "taxTotal",
           from: currentTax,
           to: expectedTax,
-          source: hasVatInclusiveMemory ? "vendor_memory" : "rawText_heuristic",
+          source: canUseVatMem ? "vendor_memory" : "rawText_heuristic",
           confidence: appliedConfidence,
           reason: `VAT-inclusive pricing detected; taxTotal should be grossTotal - netTotal (${expectedTax}).`,
         });
-        pushedAnyVatFix = true;
+        pushedAny = true;
       }
 
-      if (pushedAnyVatFix) {
+      if (pushedAny) {
         reasoningParts.push(
-          hasVatInclusiveMemory
-            ? "Applied vendor memory: VAT-inclusive pricing → recompute totals."
+          canUseVatMem
+            ? "Applied vendor memory (decayed): VAT-inclusive pricing → recompute totals."
             : "Heuristic: VAT-inclusive pricing detected in rawText → propose recompute totals."
         );
         confidenceScore = Math.max(confidenceScore, appliedConfidence);
-      } else {
-        reasoningParts.push(
-          hasVatInclusiveMemory
-            ? "Recognized VAT-inclusive pricing (vendor memory). Totals appear consistent; no correction needed."
-            : "Recognized VAT-inclusive pricing (heuristic). Totals appear consistent; no correction needed."
-        );
-        confidenceScore = Math.max(confidenceScore, hasVatInclusiveMemory ? 0.75 : 0.55);
       }
     }
   }
 
-  // Qty mismatch → Delivery Note qty
+  // Qty mismatch → DN qty
   for (const li of extracted.fields?.lineItems ?? []) {
     if (!li.sku || !Number.isFinite(li.qty)) continue;
 
@@ -489,21 +522,27 @@ export function runPipeline(
     const res = getResolution(db, vendor, resKey);
 
     const foundMem = findCorrectionMemory(db, vendor, "lineItems[].qty", "sku", li.sku);
-    const mem =
-      foundMem && !isSuspectCorrectionMemory({ mem: foundMem, resolution: res })
-        ? foundMem
-        : null;
+    const canUseMem =
+      foundMem && !isSuspectCorrectionMemory({ mem: foundMem, resolution: res, now });
 
-    if (foundMem && !mem) {
+    if (foundMem && !canUseMem) {
       auditTrail.push({
         step: "apply",
         timestamp: nowIso(now),
-        details: `Skipped correction memory for qty (id=${foundMem.id}) as suspect/disabled.`,
+        details: `Skipped correction memory for qty as suspect/disabled/decayed (id=${foundMem.id}).`,
       });
     }
 
-    const base = mem ? Math.max(0.75, Number(mem.confidence ?? 0.75)) : 0.6;
-    const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base });
+    const base = canUseMem ? Math.max(0.75, Number(foundMem.confidence ?? 0.75)) : 0.6;
+
+    const baseAfterDecay = canUseMem
+      ? decayedConfidence(
+          base,
+          daysSince(foundMem?.lastUsedAt ?? foundMem?.createdAt ?? null, now)
+        )
+      : base;
+
+    const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base: baseAfterDecay });
     const confidence = shaped.adjusted;
 
     auditTrail.push({
@@ -516,15 +555,15 @@ export function runPipeline(
       field: `lineItems[sku=${li.sku}].qty`,
       from: li.qty,
       to: dnQty,
-      source: mem ? "correction_memory" : "reference_heuristic",
+      source: canUseMem ? "correction_memory" : "reference_heuristic",
       confidence,
       reason: `Delivery note quantity (${dnQty}) differs from invoice quantity (${li.qty}) for SKU ${li.sku}.`,
     });
 
-    if (mem) {
-      markUsed(db, mem.id);
-      usedCorrectionMemoryIds.add(mem.id);
-      reasoningParts.push(`Applied learned qty correction for SKU ${li.sku} from correction memory.`);
+    if (canUseMem) {
+      markUsed(db, foundMem.id);
+      usedCorrectionMemoryIds.add(foundMem.id);
+      reasoningParts.push(`Applied correction memory (decayed) for qty by SKU ${li.sku}.`);
     } else {
       reasoningParts.push(`Heuristic: delivery note qty differs for SKU ${li.sku}.`);
     }
@@ -532,10 +571,10 @@ export function runPipeline(
     confidenceScore = Math.max(confidenceScore, confidence);
   }
 
-  // Currency memory awareness
-  const hasCurrencyMemory = vendorMems.some((m) => m.kind === "currency_from_rawText");
+  // Currency recovery: heuristic first, then correction-memory fallback
+  const currencyMem = vendorMemsAll.find((m: any) => m.kind === "currency_from_rawText");
+  const canUseCurrencyMem = currencyMem ? canApplyVendorMem(currencyMem, now) : false;
 
-  // Currency recovery (only if currency missing)
   if (extracted.fields?.currency == null) {
     const cur = parseCurrency(rawText);
 
@@ -543,8 +582,12 @@ export function runPipeline(
       const resKey = RES_KEYS.currency;
       usedResolutionKeys.add(resKey);
 
-      const base = hasCurrencyMemory ? 0.85 : 0.7;
-      const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base });
+      const base = canUseCurrencyMem ? 0.85 : 0.7;
+      const baseAfterDecay = canUseCurrencyMem
+        ? decayedConfidence(base, daysSince(currencyMem?.lastUsedAt ?? currencyMem?.createdAt ?? null, now))
+        : base;
+
+      const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base: baseAfterDecay });
       const appliedConfidence = shaped.adjusted;
 
       auditTrail.push({
@@ -557,29 +600,43 @@ export function runPipeline(
         field: "currency",
         from: null,
         to: cur,
-        source: hasCurrencyMemory ? "vendor_memory" : "rawText_heuristic",
+        source: canUseCurrencyMem ? "vendor_memory" : "rawText_heuristic",
         confidence: appliedConfidence,
         reason: `Recovered currency from rawText (${cur}).`,
       });
 
       reasoningParts.push(
-        hasCurrencyMemory
-          ? "Applied vendor memory: currency can be recovered from rawText for this vendor."
+        canUseCurrencyMem
+          ? "Applied vendor memory (decayed): currency can be recovered from rawText."
           : "Heuristic: recovered missing currency from rawText."
       );
 
       confidenceScore = Math.max(confidenceScore, appliedConfidence);
     } else {
-      // ✅ correction memory fallback (ONLY if parseCurrency fails)
+      // fallback correction memory: currency by vendor default
       const resKey = RES_KEYS.currency;
       usedResolutionKeys.add(resKey);
 
       const res = getResolution(db, vendor, resKey);
       const mem = findCorrectionMemory(db, vendor, "currency", "vendor", "default");
+      const canUseMem = mem && !isSuspectCorrectionMemory({ mem, resolution: res, now });
 
-      if (mem && !isSuspectCorrectionMemory({ mem, resolution: res })) {
+      if (mem && !canUseMem) {
+        auditTrail.push({
+          step: "apply",
+          timestamp: nowIso(now),
+          details: `Skipped correction memory for currency as suspect/disabled/decayed (id=${mem.id}).`,
+        });
+      }
+
+      if (canUseMem) {
         const base = Math.max(0.7, Number(mem.confidence ?? 0.7));
-        const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base });
+        const baseAfterDecay = decayedConfidence(
+          base,
+          daysSince(mem.lastUsedAt ?? mem.createdAt ?? null, now)
+        );
+
+        const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base: baseAfterDecay });
 
         proposedCorrections.push({
           field: "currency",
@@ -587,8 +644,7 @@ export function runPipeline(
           to: mem.recommendedValue,
           source: "correction_memory",
           confidence: shaped.adjusted,
-          reason:
-            "Currency missing and rawText parse failed; applied correction memory fallback.",
+          reason: "Currency missing and rawText parse failed; applied correction memory fallback.",
         });
 
         markUsed(db, mem.id);
@@ -601,12 +657,6 @@ export function runPipeline(
         });
 
         confidenceScore = Math.max(confidenceScore, shaped.adjusted);
-      } else if (mem) {
-        auditTrail.push({
-          step: "apply",
-          timestamp: nowIso(now),
-          details: `Skipped correction memory for currency (id=${mem.id}) as suspect/disabled.`,
-        });
       }
     }
   }
@@ -615,7 +665,7 @@ export function runPipeline(
   const isFreightVendor = /freight\s*&\s*co/i.test(vendor);
 
   if (isFreightVendor) {
-    // Freight & Co: Skonto extraction (only if discountTerms missing)
+    // discountTerms
     if (extracted.fields?.discountTerms == null) {
       const skonto = extractSkonto(rawText);
 
@@ -623,9 +673,15 @@ export function runPipeline(
         const resKey = RES_KEYS.skonto;
         usedResolutionKeys.add(resKey);
 
-        const hasSkontoMemory = vendorMems.some((m) => m.kind === "skonto_terms");
-        const base = hasSkontoMemory ? 0.85 : 0.6;
-        const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base });
+        const skontoMem = vendorMemsAll.find((m: any) => m.kind === "skonto_terms");
+        const canUseSkontoMem = skontoMem ? canApplyVendorMem(skontoMem, now) : false;
+
+        const base = canUseSkontoMem ? 0.85 : 0.6;
+        const baseAfterDecay = canUseSkontoMem
+          ? decayedConfidence(base, daysSince(skontoMem?.lastUsedAt ?? skontoMem?.createdAt ?? null, now))
+          : base;
+
+        const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base: baseAfterDecay });
         const appliedConfidence = shaped.adjusted;
 
         auditTrail.push({
@@ -638,31 +694,43 @@ export function runPipeline(
           field: "discountTerms",
           from: null,
           to: skonto,
-          source: hasSkontoMemory ? "vendor_memory" : "rawText_heuristic",
+          source: canUseSkontoMem ? "vendor_memory" : "rawText_heuristic",
           confidence: appliedConfidence,
           reason: `Detected ${skonto.percent}% Skonto if paid within ${skonto.days} days.`,
         });
 
         reasoningParts.push(
-          hasSkontoMemory
-            ? "Applied vendor memory: Freight & Co uses Skonto payment terms."
+          canUseSkontoMem
+            ? "Applied vendor memory (decayed): Freight & Co uses Skonto terms."
             : "Heuristic: detected Skonto payment terms in rawText."
         );
 
         confidenceScore = Math.max(confidenceScore, appliedConfidence);
       } else {
-        // ✅ correction memory fallback (ONLY if regex fails)
+        // fallback correction memory
         const resKey = RES_KEYS.skonto;
         usedResolutionKeys.add(resKey);
 
         const res = getResolution(db, vendor, resKey);
         const mem = findCorrectionMemory(db, vendor, "discountTerms", "vendor", "default");
+        const canUseMem = mem && !isSuspectCorrectionMemory({ mem, resolution: res, now });
 
-        if (mem && !isSuspectCorrectionMemory({ mem, resolution: res })) {
+        if (mem && !canUseMem) {
+          auditTrail.push({
+            step: "apply",
+            timestamp: nowIso(now),
+            details: `Skipped correction memory for discountTerms as suspect/disabled/decayed (id=${mem.id}).`,
+          });
+        }
+
+        if (canUseMem) {
           const base = Math.max(0.7, Number(mem.confidence ?? 0.7));
-          const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base });
+          const baseAfterDecay = decayedConfidence(
+            base,
+            daysSince(mem.lastUsedAt ?? mem.createdAt ?? null, now)
+          );
+          const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base: baseAfterDecay });
 
-          // mem.recommendedValue may be JSON string (e.g. {"percent":2,"days":10})
           const parsed = (() => {
             try {
               return JSON.parse(mem.recommendedValue);
@@ -677,8 +745,7 @@ export function runPipeline(
             to: parsed,
             source: "correction_memory",
             confidence: shaped.adjusted,
-            reason:
-              "Skonto terms missing and rawText extraction failed; applied correction memory fallback.",
+            reason: "Skonto missing and rawText extraction failed; applied correction memory fallback.",
           });
 
           markUsed(db, mem.id);
@@ -691,17 +758,11 @@ export function runPipeline(
           });
 
           confidenceScore = Math.max(confidenceScore, shaped.adjusted);
-        } else if (mem) {
-          auditTrail.push({
-            step: "apply",
-            timestamp: nowIso(now),
-            details: `Skipped correction memory for discountTerms (id=${mem.id}) as suspect/disabled.`,
-          });
         }
       }
     }
 
-    // Freight & Co: SKU mapping (only if any freight-ish line has sku missing)
+    // freight SKU mapping
     const freightItem = extracted.fields?.lineItems?.find(
       (li: any) => li.sku == null && /shipping|seefracht|transport/i.test(li.description ?? "")
     );
@@ -712,31 +773,29 @@ export function runPipeline(
 
       const res = getResolution(db, vendor, resKey);
 
-      // ✅ correction memory option (prefer if safe)
-      const mem = findCorrectionMemory(
-        db,
-        vendor,
-        "lineItems[].sku",
-        "vendor",
-        "freight_desc_missing_sku"
+      const mem = findCorrectionMemory(db, vendor, "lineItems[].sku", "vendor", "freight_desc_missing_sku");
+      const canUseMem = mem && !isSuspectCorrectionMemory({ mem, resolution: res, now });
+
+      const skuVendorMem = vendorMemsAll.find(
+        (m: any) => m.kind === "sku_mapping" && m.pattern === "FREIGHT"
       );
+      const canUseSkuVendorMem = skuVendorMem ? canApplyVendorMem(skuVendorMem, now) : false;
 
-      const hasSkuMemory = vendorMems.some(
-        (m) => m.kind === "sku_mapping" && m.pattern === "FREIGHT"
-      );
+      const pickedSku = canUseMem ? mem.recommendedValue : "FREIGHT";
 
-      const pickedSku =
-        mem && !isSuspectCorrectionMemory({ mem, resolution: res })
-          ? mem.recommendedValue
-          : "FREIGHT";
-
-      const base = mem
+      const base = canUseMem
         ? Math.max(0.7, Number(mem.confidence ?? 0.7))
-        : hasSkuMemory
+        : canUseSkuVendorMem
         ? 0.85
         : 0.6;
 
-      const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base });
+      const baseAfterDecay = canUseMem
+        ? decayedConfidence(base, daysSince(mem.lastUsedAt ?? mem.createdAt ?? null, now))
+        : canUseSkuVendorMem
+        ? decayedConfidence(base, daysSince(skuVendorMem?.lastUsedAt ?? skuVendorMem?.createdAt ?? null, now))
+        : base;
+
+      const shaped = applyResolutionMemoryToConfidence({ db, vendor, key: resKey, base: baseAfterDecay });
       const appliedConfidence = shaped.adjusted;
 
       auditTrail.push({
@@ -749,27 +808,21 @@ export function runPipeline(
         field: "lineItems[].sku",
         from: null,
         to: pickedSku,
-        source: mem
-          ? "correction_memory"
-          : hasSkuMemory
-          ? "vendor_memory"
-          : "rawText_heuristic",
+        source: canUseMem ? "correction_memory" : canUseSkuVendorMem ? "vendor_memory" : "rawText_heuristic",
         confidence: appliedConfidence,
-        reason: mem
-          ? "Applied correction memory freight SKU mapping."
-          : "Freight-related description mapped to SKU FREIGHT.",
+        reason: canUseMem ? "Applied correction memory freight SKU mapping." : "Freight-related description mapped to SKU FREIGHT.",
       });
 
-      if (mem && pickedSku === mem.recommendedValue && !isSuspectCorrectionMemory({ mem, resolution: res })) {
+      if (canUseMem) {
         markUsed(db, mem.id);
         usedCorrectionMemoryIds.add(mem.id);
       }
 
       reasoningParts.push(
-        mem
-          ? "Applied correction memory: freight descriptions map to a learned SKU."
-          : hasSkuMemory
-          ? "Applied vendor memory: Freight descriptions map to SKU FREIGHT."
+        canUseMem
+          ? "Applied correction memory (decayed): freight descriptions map to a learned SKU."
+          : canUseSkuVendorMem
+          ? "Applied vendor memory (decayed): Freight descriptions map to SKU FREIGHT."
           : "Heuristic: freight-related description suggests SKU FREIGHT."
       );
 
@@ -795,7 +848,6 @@ export function runPipeline(
 
   const criticalMissing = hasCriticalMissingFields(normalized);
 
-  // FIX #3: always escalate if criticalMissing, regardless of whether corrections exist
   const requiresHumanReview = anyLowConfidence || criticalMissing;
 
   auditTrail.push({
@@ -813,15 +865,14 @@ export function runPipeline(
         : "Auto-correct possible: all corrections high confidence.",
   });
 
-  // FIX #4 (recommended): confidenceScore = min proposed confidence (so low-confidence isn't hidden)
+  // ✅ confidenceScore = MIN proposed confidence (do not hide low-confidence)
   if (proposedCorrections.length > 0) {
-    const minC = Math.min(
-      ...proposedCorrections.map((c: any) => Number(c.confidence ?? 0))
-    );
-    confidenceScore = Math.min(confidenceScore, round2(minC));
+    const minC = Math.min(...proposedCorrections.map((c: any) => Number(c.confidence ?? 0)));
+    confidenceScore = round2(minC);
   }
 
   /* -------- LEARN -------- */
+
   if (hasLearned(db, invoiceId)) {
     auditTrail.push({
       step: "learn",
@@ -834,31 +885,53 @@ export function runPipeline(
       (x: any) => x.finalDecision === "approved" || x.finalDecision === "rejected"
     );
 
-    const finalDecision = decisionRow?.finalDecision as
-      | "approved"
-      | "rejected"
-      | undefined;
+    const finalDecision = decisionRow?.finalDecision as "approved" | "rejected" | undefined;
 
     if (finalDecision) {
-      // ✅ Wrong-memory handling: if rejected, penalize/disable used correction memories
+      // ✅ Wrong-memory handling: penalize correction memories used if rejected
       if (finalDecision === "rejected" && usedCorrectionMemoryIds.size > 0) {
         for (const memId of usedCorrectionMemoryIds) {
-          markRejected(db, memId);
+          const out = markRejected(db, memId);
           auditTrail.push({
             step: "learn",
             timestamp: nowIso(now),
-            details: `Correction memory penalized: ${memId} marked rejected (may disable after 2 rejects).`,
+            details: `Correction memory rejected: ${memId} (rejectCount=${out.rejectCount}, status=${out.status ?? "n/a"}).`,
+          });
+
+          logAuditEvent(db, {
+            eventType: "CORRECTION_MEMORY_REJECTED",
+            vendor,
+            invoiceId,
+            meta: { id: memId, rejectCount: out.rejectCount, status: out.status },
+            now,
           });
         }
       }
 
-      // 1) Vendor memory learns ONLY on approved (guardrails)
+      // ✅ Wrong-memory handling for vendor memory on rejected:
+      // if you add markVendorRejected(db, id) in vendorMemory.ts, wire it here.
+      if (finalDecision === "rejected") {
+        const maybeUsedVendorMemIds: string[] = []; // if you want, collect these like usedCorrectionMemoryIds
+        for (const vmId of maybeUsedVendorMemIds) {
+          try {
+            const out = markVendorRejected(db, vmId);
+            auditTrail.push({
+              step: "learn",
+              timestamp: nowIso(now),
+              details: `Vendor memory rejected: ${vmId} (rejectCount=${out.rejectCount}, status=${out.status ?? "n/a"}).`,
+            });
+          } catch {
+            // ignore if you haven't implemented vendor reject tracking yet
+          }
+        }
+      }
+
+      // vendor + correction learning only on approved (your existing logic)
       if (finalDecision === "approved") {
-        // Supplier memory learns (serviceDate/poNumber)
         const serviceFix = decisionRow.corrections?.find((c: any) => c.field === "serviceDate");
         if (serviceFix) {
           const id = `${vendor}::serviceDate_from_label::Leistungsdatum`;
-          const existing = vendorMems.find((m) => m.id === id);
+          const existing = vendorMemsAll.find((m: any) => m.id === id);
           const nextConfidence = Math.min(0.95, (existing?.confidence ?? 0.6) + 0.1);
 
           upsertVendorMemory(db, {
@@ -879,7 +952,7 @@ export function runPipeline(
         const poFix = decisionRow.corrections?.find((c: any) => c.field === "poNumber");
         if (poFix) {
           const id = `${vendor}::po_match_strategy::sku_and_date_window`;
-          const existing = vendorMems.find((m) => m.id === id);
+          const existing = vendorMemsAll.find((m: any) => m.id === id);
           const nextConfidence = Math.min(0.95, (existing?.confidence ?? 0.6) + 0.1);
 
           upsertVendorMemory(db, {
@@ -897,14 +970,13 @@ export function runPipeline(
           memoryUpdates.push({ type: "vendor_memory_upsert", id, confidence: nextConfidence });
         }
 
-        // Learn VAT-inclusive strategy if totals were corrected and rawText hints VAT included
         const touchesTotals = (decisionRow.corrections ?? []).some(
           (c: any) => c.field === "taxTotal" || c.field === "grossTotal"
         );
 
         if (touchesTotals && isVatInclusiveText(rawText)) {
           const id = `${vendor}::vat_inclusive_pricing::mwst_inkl`;
-          const existing = vendorMems.find((m) => m.id === id);
+          const existing = vendorMemsAll.find((m: any) => m.id === id);
           const nextConfidence = Math.min(0.95, (existing?.confidence ?? 0.6) + 0.1);
 
           upsertVendorMemory(db, {
@@ -927,11 +999,10 @@ export function runPipeline(
           });
         }
 
-        // Learn currency recovery behavior
         const currencyFix = decisionRow.corrections?.find((c: any) => c.field === "currency");
         if (currencyFix) {
           const id = `${vendor}::currency_from_rawText::default`;
-          const existing = vendorMems.find((m) => m.id === id);
+          const existing = vendorMemsAll.find((m: any) => m.id === id);
           const nextConfidence = Math.min(0.95, (existing?.confidence ?? 0.6) + 0.1);
 
           upsertVendorMemory(db, {
@@ -954,79 +1025,12 @@ export function runPipeline(
           });
         }
 
-        /* -------- Freight & Co: learning (Skonto + SKU mapping) -------- */
-        if (isFreightVendor) {
-          const skontoFix = decisionRow.corrections?.find((c: any) => c.field === "discountTerms");
-          if (skontoFix) {
-            const id = `${vendor}::skonto_terms::default`;
-            const existing = vendorMems.find((m) => m.id === id);
-            const supportCount = (existing?.supportCount ?? 0) + 1;
-            const rejectCount = existing?.rejectCount ?? 0;
-            const nextConfidence = Math.min(0.95, (existing?.confidence ?? 0.6) + 0.1);
-
-            upsertVendorMemory(db, {
-              id,
-              vendor,
-              kind: "skonto_terms",
-              pattern: "default",
-              confidence: nextConfidence,
-              supportCount,
-              rejectCount,
-              lastUsedAt: nowIso(now),
-              status: "active",
-            });
-
-            memoryUpdates.push({
-              type: "vendor_memory_upsert",
-              id,
-              confidence: nextConfidence,
-              note: "Learned Skonto terms pattern for Freight & Co.",
-            });
-          }
-
-          const skuFix = decisionRow.corrections?.find(
-            (c: any) =>
-              c.field === "lineItems[].sku" ||
-              (typeof c.field === "string" &&
-                c.field.includes("lineItems") &&
-                c.field.includes("sku"))
-          );
-
-          if (skuFix) {
-            const id = `${vendor}::sku_mapping::FREIGHT`;
-            const existing = vendorMems.find((m) => m.id === id);
-            const supportCount = (existing?.supportCount ?? 0) + 1;
-            const rejectCount = existing?.rejectCount ?? 0;
-            const nextConfidence = Math.min(0.95, (existing?.confidence ?? 0.6) + 0.1);
-
-            upsertVendorMemory(db, {
-              id,
-              vendor,
-              kind: "sku_mapping",
-              pattern: "FREIGHT",
-              confidence: nextConfidence,
-              supportCount,
-              rejectCount,
-              lastUsedAt: nowIso(now),
-              status: "active",
-            });
-
-            memoryUpdates.push({
-              type: "vendor_memory_upsert",
-              id,
-              confidence: nextConfidence,
-              note: "Learned freight SKU mapping to FREIGHT.",
-            });
-          }
-        }
-
-        // 2) Correction memory learns ONLY on approved (guardrails)
         const qtyFixes = (decisionRow.corrections ?? []).filter(
           (c: any) => typeof c.field === "string" && c.field.includes(".qty")
         );
 
         for (const fix of qtyFixes) {
-          const skuMatch = String(fix.field).match(/sku=([A-Z0-9\\-]+)/i);
+          const skuMatch = String(fix.field).match(/sku=([A-Z0-9\-]+)/i);
           if (!skuMatch) continue;
 
           const sku = skuMatch[1];
@@ -1045,15 +1049,11 @@ export function runPipeline(
             status: "active",
           });
 
-          memoryUpdates.push({
-            type: "correction_memory_upsert",
-            id,
-            confidence: result.confidence,
-          });
+          memoryUpdates.push({ type: "correction_memory_upsert", id, confidence: result.confidence });
         }
       }
 
-      // 3) Resolution memory ALWAYS records (approved OR rejected)
+      // resolution memory always records approved/rejected
       if (usedResolutionKeys.size > 0) {
         for (const key of usedResolutionKeys) {
           const out = recordResolutionDecision(db, {
@@ -1064,8 +1064,7 @@ export function runPipeline(
           });
 
           logAuditEvent(db, {
-            eventType:
-              finalDecision === "approved" ? "RESOLUTION_APPROVED" : "RESOLUTION_REJECTED",
+            eventType: finalDecision === "approved" ? "RESOLUTION_APPROVED" : "RESOLUTION_REJECTED",
             vendor,
             invoiceId,
             meta: {

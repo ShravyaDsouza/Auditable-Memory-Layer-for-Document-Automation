@@ -19,8 +19,15 @@ function nowIso() {
 }
 
 export function getVendorMemories(db: Database, vendor: string): VendorMemory[] {
+  // if you might not always have disabledAt column, simplest is just filter on BOTH
   return db
-    .prepare(`SELECT * FROM vendor_memory WHERE vendor = ?`)
+    .prepare(`
+      SELECT *
+      FROM vendor_memory
+      WHERE vendor = ?
+        AND status = 'active'
+        AND (disabledAt IS NULL OR disabledAt = '')
+    `)
     .all(vendor) as VendorMemory[];
 }
 
@@ -76,4 +83,21 @@ export function penalizeVendorMemory(db: Database, id: string, amount = 0.15) {
       meta: { reason: "rejectCount>=2" },
     });
   }
+}
+export function incrementVendorMemoryReject(db: Database, id: string, nowIso: string) {
+  db.prepare(`
+    UPDATE vendor_memory
+    SET rejectCount = COALESCE(rejectCount, 0) + 1,
+        lastUsedAt = COALESCE(lastUsedAt, @nowIso)
+    WHERE id = @id
+  `).run({ id, nowIso });
+}
+
+export function disableVendorMemory(db: Database, id: string, nowIso: string) {
+  db.prepare(`
+    UPDATE vendor_memory
+    SET status = 'disabled',
+        lastUsedAt = COALESCE(lastUsedAt, @nowIso)
+    WHERE id = @id
+  `).run({ id, nowIso });
 }

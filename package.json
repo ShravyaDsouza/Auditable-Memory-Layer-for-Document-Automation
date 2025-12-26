@@ -4,7 +4,9 @@
   "main": "index.js",
   "scripts": {
     "demo": "tsx src/demo/runInvoice.ts",
-    "admin:list": "tsx src/admin/listMemory.ts",
+    "admin:list": "tsx src/admin/list.ts",
+    "admin:disable": "tsx src/admin/adminCli.ts disable",
+    "admin:reset-confidence": "tsx src/admin/adminCli.ts reset-confidence",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
