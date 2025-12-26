@@ -4,6 +4,8 @@ import { getVendorMemories, upsertVendorMemory } from "../db/vendorMemory.js";
 import { hasLearned, markLearned } from "../db/learningEvents.js";
 import { detectDuplicate, recordDuplicate } from "./duplicateGuard.js";
 import { logAuditEvent } from "../db/auditEvents.js";
+import { getCorrectionMemories, findCorrectionMemory, markUsed,} from "../db/correctionMemory.js";
+
 
 /* ------------------ Helpers ------------------ */
 
@@ -116,6 +118,27 @@ function suggestPoNumber(
   return null;
 }
 
+function findMatchingDeliveryQty(
+  context: any,
+  sku: string
+): number | null {
+  const vendor = context.vendor;
+  const invoicePo = context.extracted.fields?.poNumber;
+
+  const dns = (context.reference?.deliveryNotes ?? [])
+    .filter((dn: any) => dn.vendor === vendor)
+    .filter((dn: any) => !invoicePo || dn.poNumber === invoicePo);
+
+  for (const dn of dns) {
+    const li = dn.lineItems?.find((x: any) => x.sku === sku);
+    if (li && Number.isFinite(li.qtyDelivered)) {
+      return li.qtyDelivered;
+    }
+  }
+
+  return null;
+}
+
 /* ------------------ Pipeline ------------------ */
 
 export function runPipeline(
@@ -199,6 +222,14 @@ export function runPipeline(
     step: "recall",
     timestamp: nowIso(now),
     details: `Recalled ${vendorMems.length} vendor memories for ${vendor}.`,
+  });
+
+  const corrMems = getCorrectionMemories(db, vendor);
+
+  auditTrail.push({
+    step: "recall",
+    timestamp: nowIso(now),
+    details: `Recalled ${corrMems.length} correction memories for ${vendor}.`,
   });
 
   /* -------- APPLY -------- */
@@ -329,6 +360,46 @@ export function runPipeline(
     }
   }
 
+  for (const li of extracted.fields?.lineItems ?? []) {
+  if (!li.sku || !Number.isFinite(li.qty)) continue;
+
+  const dnQty = findMatchingDeliveryQty(context, li.sku);
+  if (dnQty == null || dnQty === li.qty) continue;
+
+  const mem = findCorrectionMemory(
+    db,
+    vendor,
+    "lineItems[].qty",
+    "sku",
+    li.sku
+  );
+
+  const confidence = mem
+    ? Math.max(0.75, mem.confidence)
+    : 0.6;
+
+  proposedCorrections.push({
+    field: `lineItems[sku=${li.sku}].qty`,
+    from: li.qty,
+    to: dnQty,
+    source: mem ? "correction_memory" : "reference_heuristic",
+    confidence,
+    reason: `Delivery note quantity (${dnQty}) differs from invoice quantity (${li.qty}) for SKU ${li.sku}.`,
+  });
+
+  if (mem) {
+    markUsed(db, mem.id);
+    reasoningParts.push(
+      `Applied learned qty correction for SKU ${li.sku} from correction memory.`
+    );
+  } else {
+    reasoningParts.push(
+      `Heuristic: delivery note qty differs for SKU ${li.sku}.`
+    );
+  }
+
+  confidenceScore = Math.max(confidenceScore, confidence);
+}
   // Currency memory awareness
   const hasCurrencyMemory = vendorMems.some((m) => m.kind === "currency_from_rawText");
 
@@ -618,7 +689,36 @@ export function runPipeline(
           });
         }
       }
+       const qtyFixes = (approved.corrections ?? []).filter(
+      (c: any) => typeof c.field === "string" && c.field.includes(".qty")
+    );
 
+    for (const fix of qtyFixes) {
+      const skuMatch = String(fix.field).match(/sku=([A-Z0-9\-]+)/i);
+      if (!skuMatch) continue;
+
+      const sku = skuMatch[1];
+      const id = `${vendor}::lineItems[].qty::sku::${sku}`;
+
+      const result = upsertCorrectionMemory(db, {
+        id,
+        vendor,
+        fieldPath: "lineItems[].qty",
+        patternType: "sku",
+        patternValue: sku,
+        recommendedValue: String(fix.to),
+        confidence: 0.7,
+        lastUsedAt: nowIso(now),
+        createdAt: nowIso(now),
+        status: "active",
+      });
+
+      memoryUpdates.push({
+        type: "correction_memory_upsert",
+        id,
+        confidence: result.confidence,
+      });
+    }
       markLearned(db, invoiceId);
 
       // Optional: audit event for learning
