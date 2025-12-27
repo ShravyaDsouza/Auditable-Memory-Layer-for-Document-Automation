@@ -1,4 +1,3 @@
-// src/db/resolutionMemory.ts
 import type Database from "better-sqlite3";
 
 export type ResolutionDecision = "approved" | "rejected";
@@ -11,10 +10,10 @@ export type ResolutionValueJson = {
 };
 
 export type ResolutionMemoryRow = {
-  id?: number; // sqlite AUTOINCREMENT
+  id?: number;
   vendor: string;
   key: string;
-  valueJson: string; // stored JSON string
+  valueJson: string;
   confidence: number;
   rejectCount?: number;
   lastUsedAt: string | null;
@@ -57,9 +56,6 @@ function safeParseValueJson(v: unknown): ResolutionValueJson {
   }
 }
 
-/**
- * Fetch a resolution row (ignores disabled rows if disabledAt column exists).
- */
 export function getResolution(
   db: Database.Database,
   vendor: string,
@@ -84,10 +80,6 @@ export function getResolution(
   return { ...row, value: safeParseValueJson((row as any).valueJson) };
 }
 
-/**
- * Upsert a resolution row by (vendor,key).
- * NOTE: Table has UNIQUE(vendor,key), so we use ON CONFLICT(vendor,key).
- */
 export function upsertResolution(
   db: Database.Database,
   vendor: string,
@@ -108,15 +100,12 @@ export function upsertResolution(
   const disabledAtCol = hasCol(db, "disabledAt");
   const rejectCountCol = hasCol(db, "rejectCount");
 
-  // If patch explicitly sets disabledAt (or null), respect it; otherwise keep existing.
   const nextDisabledAt =
     disabledAtCol ? (patch.disabledAt !== undefined ? patch.disabledAt : (existing as any)?.disabledAt ?? null) : undefined;
 
-  // Keep rejectCount stable unless you explicitly change it elsewhere
   const nextRejectCount =
     rejectCountCol ? Number((existing as any)?.rejectCount ?? 0) : undefined;
 
-  // Build dynamic column sets
   const setCols: string[] = [
     `valueJson = excluded.valueJson`,
     `confidence = excluded.confidence`,
@@ -159,11 +148,6 @@ export function upsertResolution(
   return { vendor, key, confidence: nextConfidence, value: nextValue };
 }
 
-/**
- * Apply resolution history to a baseConfidence.
- * - boosts if mostly approved
- * - penalizes/caps if rejected frequently
- */
 export function applyResolutionToConfidence(
   db: Database.Database,
   vendor: string,
@@ -179,24 +163,18 @@ export function applyResolutionToConfidence(
 
   if (total === 0) return { confidence: baseConfidence, note: "No resolution history." };
 
-  // Hard cap if repeatedly rejected and never approved
   if (r >= 2 && a === 0) {
     const capped = Math.min(baseConfidence, 0.6);
     return { confidence: capped, note: `Mostly rejected historically (approved=${a}, rejected=${r}) → capped.` };
   }
 
-  const approvalRatio = a / total; // [0..1]
-  // delta in approx [-0.1..+0.1]
+  const approvalRatio = a / total;
   const delta = (approvalRatio - 0.5) * 0.2;
   const next = Math.max(0.2, Math.min(0.95, baseConfidence + delta));
 
   return { confidence: next, note: `Resolution: approved=${a}, rejected=${r}, ${baseConfidence}→${next}` };
 }
 
-/**
- * Record an APPROVED/REJECTED decision for a (vendor,key).
- * Also evolves row confidence and (optionally) disables strategy if repeatedly rejected.
- */
 export function recordResolutionDecision(
   db: Database.Database,
   args: { vendor: string; key: string; decision: ResolutionDecision; invoiceId: string }
@@ -232,7 +210,6 @@ export function recordResolutionDecision(
   value.lastDecision = decision;
   value.lastInvoiceId = invoiceId;
 
-  // Simple confidence evolution for the resolution itself
   let confidence = existingAny?.confidence ?? 0.5;
   if (decision === "approved") confidence = Math.min(0.95, confidence + 0.05);
   if (decision === "rejected") confidence = Math.max(0.2, confidence - 0.1);
@@ -240,11 +217,9 @@ export function recordResolutionDecision(
   const rejectCountCol = hasCol(db, "rejectCount");
   const disabledAtCol = hasCol(db, "disabledAt");
 
-  // If rejected, increment rejectCount (if present)
   let nextRejectCount = rejectCountCol ? Number((existingAny as any)?.rejectCount ?? 0) : 0;
   if (decision === "rejected" && rejectCountCol) nextRejectCount += 1;
 
-  // Disable if repeatedly rejected and never approved (optional but recommended)
   let disabledAt: string | null | undefined = undefined;
   if (disabledAtCol) {
     const a = value.approved;
@@ -253,12 +228,9 @@ export function recordResolutionDecision(
       disabledAt = nowIso();
       confidence = Math.min(confidence, 0.2);
     } else {
-      // keep existing disabledAt as-is unless we disable now
       disabledAt = (existingAny as any)?.disabledAt ?? null;
     }
   }
-
-  // Upsert base fields
   const out = upsertResolution(db, vendor, key, {
     value,
     confidence,
@@ -266,7 +238,6 @@ export function recordResolutionDecision(
     ...(disabledAtCol ? { disabledAt } : {}),
   });
 
-  // Persist rejectCount if column exists
   if (rejectCountCol) {
     db.prepare(
       `
@@ -279,7 +250,6 @@ export function recordResolutionDecision(
 
   return { vendor, key, value: out.value, confidence: out.confidence };
 }
-
 export function getAllResolutionsForVendor(db: Database, vendor: string) {
   return db
     .prepare(`SELECT * FROM resolution_memory WHERE vendor = ? ORDER BY key ASC`)

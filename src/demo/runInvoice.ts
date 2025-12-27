@@ -13,7 +13,6 @@ const repoRoot = process.cwd();
 const dataset = getArg("dataset", "full") as "initial" | "full";
 const invoiceId = getArg("invoiceId");
 
-// ✅ NEW
 const simulateDaysRaw = getArg("simulateDays", "0");
 const simulateDays = Number(simulateDaysRaw);
 
@@ -60,10 +59,8 @@ if (!invoiceId) {
 
   const fingerprint = computeFingerprint(invoice);
 
-  // ✅ NEW: shift "now" for the whole run
   const now = new Date(Date.now() + simulateDays * 24 * 60 * 60 * 1000);
 
-  // Use shifted now for createdAt too (optional but makes demo consistent)
   const createdAt = now.toISOString();
 
   db.prepare(
@@ -72,7 +69,6 @@ if (!invoiceId) {
      VALUES (?, ?, ?, ?, ?, ?)`
   ).run(invoice.invoiceId, invoice.vendor, dataset, createdAt, invoiceNumber, fingerprint);
 
-  // ✅ CRITICAL: pass now into pipeline so decay is visible
   const output = await (runPipeline as any)(db, context as any, { now });
 
   console.log(JSON.stringify(output, null, 2));

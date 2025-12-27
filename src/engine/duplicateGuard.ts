@@ -1,4 +1,3 @@
-// src/engine/duplicateGuard.ts
 import type Database from "better-sqlite3";
 
 function normalize(s: unknown) {
@@ -22,15 +21,15 @@ export function computeFingerprint(invoice: any) {
     normalize(invoice?.normalizedInvoice?.currency);
 
   const total =
-    normalize(invoice.total) ||
-    normalize(invoice?.fields?.total) ||
-    normalize(invoice?.normalizedInvoice?.total);
+  normalize(invoice.grossTotal) ||
+  normalize(invoice?.fields?.grossTotal) ||
+  normalize(invoice?.normalizedInvoice?.grossTotal) ||
+  normalize(invoice.netTotal) ||
+  normalize(invoice?.fields?.netTotal) ||
+  normalize(invoice?.normalizedInvoice?.netTotal);
 
-  // Raw text helps, but avoid hashing huge content. Take a small stable slice.
   const rawSlice = normalize(invoice.rawText).slice(0, 220);
 
-  // Most duplicates in appendix are same vendor + same invoiceNumber.
-  // Keep fingerprint stable and simple.
   return [vendor, invoiceNumber, currency, total, rawSlice].join("|");
 }
 
@@ -43,12 +42,15 @@ export function detectDuplicate(
   | { isDuplicate: true; duplicateOfInvoiceId: string; reason: string; fingerprint: string } {
   const vendor = String(invoice.vendor ?? "");
   const invoiceId = String(invoice.invoiceId ?? "");
-  const invoiceNumber =
-    String(invoice.invoiceNumber ?? invoice?.fields?.invoiceNumber ?? invoice?.normalizedInvoice?.invoiceNumber ?? "");
+  const invoiceNumber = String(
+    invoice.invoiceNumber ??
+      invoice?.fields?.invoiceNumber ??
+      invoice?.normalizedInvoice?.invoiceNumber ??
+      ""
+  );
 
   const fingerprint = computeFingerprint(invoice);
 
-  // 1) explicit cue words
   const raw = String(invoice.rawText ?? "").toLowerCase();
   const hasDuplicateCue =
     raw.includes("duplicate submission") ||
@@ -56,24 +58,62 @@ export function detectDuplicate(
     raw.includes("duplicate") ||
     raw.includes("erneut");
 
-  // 2) Strong rule: same vendor + same invoiceNumber seen before
   if (vendor && invoiceNumber) {
-    const row = db
+    const original = db
       .prepare(
         `
         SELECT invoiceId
         FROM invoice_runs
-        WHERE vendor = ? AND invoiceNumber = ? AND invoiceId != ?
-        ORDER BY rowid DESC
+        WHERE vendor = ?
+          AND invoiceNumber = ?
+          AND invoiceId != ?
+          AND COALESCE(isDuplicate, 0) = 0
+        ORDER BY rowid ASC
         LIMIT 1
-      `
+        `
       )
       .get(vendor, invoiceNumber, invoiceId) as { invoiceId: string } | undefined;
 
-    if (row?.invoiceId) {
+    if (original?.invoiceId) {
       return {
         isDuplicate: true,
-        duplicateOfInvoiceId: row.invoiceId,
+        duplicateOfInvoiceId: original.invoiceId,
+        reason: hasDuplicateCue
+          ? `Duplicate cue found in rawText; vendor+invoiceNumber already seen (${invoiceNumber}).`
+          : `Same vendor+invoiceNumber already seen (${invoiceNumber}).`,
+        fingerprint,
+      };
+    }
+
+    const any = db
+      .prepare(
+        `
+        SELECT invoiceId
+        FROM invoice_runs
+        WHERE vendor = ?
+          AND invoiceNumber = ?
+          AND invoiceId != ?
+        ORDER BY rowid ASC
+        LIMIT 1
+        `
+      )
+      .get(vendor, invoiceNumber, invoiceId) as { invoiceId: string } | undefined;
+
+    if (any?.invoiceId) {
+      const root = db
+        .prepare(
+          `
+          SELECT duplicateOfInvoiceId
+          FROM duplicate_records
+          WHERE invoiceId = ?
+          LIMIT 1
+          `
+        )
+        .get(any.invoiceId) as { duplicateOfInvoiceId: string | null } | undefined;
+
+      return {
+        isDuplicate: true,
+        duplicateOfInvoiceId: root?.duplicateOfInvoiceId ?? any.invoiceId,
         reason: hasDuplicateCue
           ? `Duplicate cue found in rawText; vendor+invoiceNumber already seen (${invoiceNumber}).`
           : `Same vendor+invoiceNumber already seen (${invoiceNumber}).`,
@@ -82,18 +122,19 @@ export function detectDuplicate(
     }
   }
 
-  // 3) Fallback: same vendor + same fingerprint already recorded in duplicate_records
   const prior = db
     .prepare(
       `
       SELECT duplicateOfInvoiceId, invoiceId
       FROM duplicate_records
       WHERE vendor = ? AND fingerprint = ? AND invoiceId != ?
-      ORDER BY createdAt DESC
+      ORDER BY createdAt ASC
       LIMIT 1
-    `
+      `
     )
-    .get(vendor, fingerprint, invoiceId) as { duplicateOfInvoiceId: string | null; invoiceId: string } | undefined;
+    .get(vendor, fingerprint, invoiceId) as
+    | { duplicateOfInvoiceId: string | null; invoiceId: string }
+    | undefined;
 
   if (prior?.invoiceId) {
     return {
@@ -104,8 +145,6 @@ export function detectDuplicate(
     };
   }
 
-  // 4) If cue exists but no match, do not auto-mark duplicate; just let pipeline continue.
-  // (prevents false positives)
   return { isDuplicate: false };
 }
 

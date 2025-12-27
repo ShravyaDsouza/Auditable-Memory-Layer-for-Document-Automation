@@ -6,7 +6,7 @@ export type HumanCorrection = {
   invoiceId: string;
   vendor: string;
   corrections: Array<{ field: string; from: unknown; to: unknown; reason: string }>;
-  finalDecision: string; // approved | rejected | ...
+  finalDecision: string;
 };
 
 export function loadCorrections(repoRoot: string, mode: DatasetMode, manifest: Manifest): HumanCorrection[] {

@@ -4,6 +4,8 @@
   "main": "index.js",
   "scripts": {
     "demo": "tsx src/demo/runInvoice.ts",
+    "demo:all": "sh src/scripts/expected.sh",
+    "demo:bonus": "sh src/scripts/bonus.sh",
     "admin:list": "tsx src/admin/list.ts",
     "admin:disable": "tsx src/admin/adminCli.ts disable",
     "admin:reset-confidence": "tsx src/admin/adminCli.ts reset-confidence",

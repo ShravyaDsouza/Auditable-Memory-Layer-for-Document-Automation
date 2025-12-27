@@ -3,7 +3,6 @@ import type Database from "better-sqlite3";
 export function migrate(db: Database) {
   db.pragma("journal_mode = WAL");
 
-  // Core tables
   db.exec(`
     CREATE TABLE IF NOT EXISTS invoice_runs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -11,8 +10,6 @@ export function migrate(db: Database) {
       vendor TEXT NOT NULL,
       dataset TEXT NOT NULL,
       createdAt TEXT NOT NULL,
-
-      -- additions for duplicates + traceability
       invoiceNumber TEXT,
       fingerprint TEXT,
       isDuplicate INTEGER NOT NULL DEFAULT 0,
@@ -37,7 +34,6 @@ export function migrate(db: Database) {
     );
   `);
 
-  // Missing rubric tables
   db.exec(`
     CREATE TABLE IF NOT EXISTS audit_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,7 +93,6 @@ export function migrate(db: Database) {
     CREATE INDEX IF NOT EXISTS idx_duplicate_records_fingerprint ON duplicate_records(fingerprint);
   `);
 
-  // Optional: governance columns for vendor_memory (safe, won’t crash if already exists)
   const safeAdd = (sql: string) => {
     try { db.exec(sql); } catch { /* ignore */ }
   };

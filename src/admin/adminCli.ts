@@ -1,4 +1,3 @@
-// src/admin/adminCli.ts
 import Database from "better-sqlite3";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -87,7 +86,6 @@ export async function runAdminCli(argv: string[]) {
   }
 }
 
-// ✅ real CLI entrypoint (ESM-safe)
 const isEntry =
   process.argv[1] &&
   path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));

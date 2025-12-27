@@ -1,4 +1,3 @@
-// src/db/auditEvents.ts
 import type Database from "better-sqlite3";
 
 function nowIso(now?: Date) {

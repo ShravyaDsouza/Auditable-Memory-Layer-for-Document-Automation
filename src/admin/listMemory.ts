@@ -56,7 +56,6 @@ export function adminList(vendor: string, simulateDays = 0) {
   console.log(`\n== Resolution Memory (${vendor}) ==`);
   if (rms.length === 0) console.log("(none)");
   for (const r of rms) {
-    // If you add decay to resolution confidence too, compute eff here similarly
     console.log({
       key: r.key,
       value: r.value,

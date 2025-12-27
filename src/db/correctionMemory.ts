@@ -1,4 +1,3 @@
-// src/db/correctionMemory.ts
 import type Database from "better-sqlite3";
 
 export type CorrectionMemoryRow = {
@@ -13,8 +12,6 @@ export type CorrectionMemoryRow = {
   rejectCount: number;
   lastUsedAt: string | null;
   createdAt: string;
-
-  // optional — only if your schema has it
   status?: "active" | "disabled";
 };
 
@@ -130,7 +127,6 @@ export function upsertCorrectionMemory(
     return { id: row.id, confidence: row.confidence };
   }
 
-  // schema WITHOUT status
   db.prepare(
     `
     INSERT INTO correction_memory (
@@ -179,7 +175,6 @@ export function markRejected(db: Database, id: string) {
     return;
   }
 
-  // schema WITHOUT status column → still track rejectCount
   db.prepare(
     `
     UPDATE correction_memory
@@ -209,7 +204,6 @@ export function incrementCorrectionMemoryReject(db: Database, id: string, nowIso
 }
 
 export function disableCorrectionMemory(db: Database, id: string, nowIso: string) {
-  // only works if status col exists; otherwise just keep rejectCount
   db.prepare(`
     UPDATE correction_memory
     SET status = 'disabled',

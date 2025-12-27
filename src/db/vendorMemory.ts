@@ -1,4 +1,3 @@
-// src/db/vendorMemory.ts
 import type Database from "better-sqlite3";
 import { logAuditEvent } from "./auditEvents.js";
 
@@ -19,7 +18,6 @@ function nowIso() {
 }
 
 export function getVendorMemories(db: Database, vendor: string): VendorMemory[] {
-  // if you might not always have disabledAt column, simplest is just filter on BOTH
   return db
     .prepare(`
       SELECT *

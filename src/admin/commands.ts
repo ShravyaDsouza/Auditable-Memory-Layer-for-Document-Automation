@@ -1,4 +1,3 @@
-// src/admin/commands.ts
 import type Database from "better-sqlite3";
 import { logAuditEvent } from "../db/auditEvents.js";
 

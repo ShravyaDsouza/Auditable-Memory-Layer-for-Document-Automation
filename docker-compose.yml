@@ -1,0 +1,7 @@
+services:
+  memlayer:
+    build: .
+    volumes:
+      - ./storage:/app/storage
+      - ./artifacts:/app/artifacts
+    platform: linux/arm64
