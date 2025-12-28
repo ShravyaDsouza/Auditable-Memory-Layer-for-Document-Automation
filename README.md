@@ -59,6 +59,7 @@ To ensure memory integrity, invoices are flagged as duplicates using Vendor ID +
 ---
 
 ## Repository Structure
+```text
 .
 ├── Dockerfile
 ├── README.md
@@ -75,7 +76,7 @@ To ensure memory integrity, invoices are flagged as duplicates using Vendor ID +
 │   ├── types/                  # TypeScript definitions
 │   └── utils/                  # Shared helpers
 └── tsconfig.json
-
+```
 ---
 
 ## Output Format
@@ -134,10 +135,10 @@ Each run produces a JSON response structured for auditability:
 
 ## Assumptions & Limitations
 
-1. Confidence thresholds are heuristic-based
-2. Memory decay is optional and non-essential to correctness
-3. Designed for clarity and auditability, not throughput
-4. SQLite chosen for simplicity and portability
+* Confidence thresholds are heuristic-based
+* Memory decay is optional and non-essential to correctness
+* Designed for clarity and auditability, not throughput
+* SQLite chosen for simplicity and portability
 
 ---
 
@@ -147,3 +148,4 @@ Each run produces a JSON response structured for auditability:
 * Any low-confidence correction triggers human review
 * Learning occurs only from approved outcomes
 * Duplicate invoices are fully isolated from learning
+
